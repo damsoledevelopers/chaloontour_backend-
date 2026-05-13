@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: chalo-on-tour-backend
+    env: node
+    buildCommand: npm install && npx puppeteer browsers install chrome
+    startCommand: npm start
+    envVars:
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/project/src/.cache/puppeteer
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      # Required: MongoDB connection string
+      - key: MONGODB_URI
+        sync: false
+      # Required: Frontend URL for CORS (can be comma-separated for multiple URLs)
+      - key: CLIENT_URL
+        sync: false
+      # Required: JWT secret for token signing
+      - key: JWT_SECRET
+        sync: false
+      # Optional: JWT expiration (defaults to '7d' if not set)
+      - key: JWT_EXPIRE
+        value: 7d
+    healthCheckPath: /api/stats/dashboard
+
