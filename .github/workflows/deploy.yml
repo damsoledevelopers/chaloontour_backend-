@@ -3,7 +3,7 @@ name: Deploy Backend
 on:
   push:
     branches:
-      - main
+      - master
 
 jobs:
   deploy:
@@ -18,8 +18,13 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT }}
           script: |
+            export NVM_DIR="/root/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+            [ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"
+
             cd /var/www/chaloontour_backend-
-            git pull origin main
+            git fetch origin master
+            git reset --hard origin/master
             npm install
-            pm2 restart chaloontour-backend
+            pm2 restart chaloontour-backend || pm2 start app.js --name chaloontour-backend
             pm2 save
