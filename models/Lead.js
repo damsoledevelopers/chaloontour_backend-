@@ -81,7 +81,12 @@ const leadSchema = new mongoose.Schema({
   payment_policy: { type: String, default: '' },
   cancellation_policy: { type: String, default: '' },
   termsAndConditions: { type: String, default: '' },
-  memorableTrip: { type: String, default: '' }
+  memorableTrip: { type: String, default: '' },
+  generatedPdf: {
+    fileName: { type: String, default: '' },
+    relativePath: { type: String, default: '' },
+    generatedAt: { type: Date, default: null }
+  }
 }, { timestamps: true });
 
 leadSchema.pre('save', async function (next) {

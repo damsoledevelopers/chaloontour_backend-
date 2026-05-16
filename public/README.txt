@@ -1,4 +1,10 @@
-Place Chalo On Tour logo here for PDF export:
-  chalo-on-tour-e1766686260447.png
+PDF branding assets (committed for production VPS).
 
-Copy from: chaloontour_frontend/public/chalo-on-tour-e1766686260447.png
+Included:
+  - chalo-on-tour-e1766686260447.png
+  - Chalo-on-tour.jpg.jpeg
+  - stamp-sign.png
+  - signature.png
+
+To refresh from frontend after logo changes:
+  npm run copy:pdf-assets

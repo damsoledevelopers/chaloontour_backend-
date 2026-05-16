@@ -4,17 +4,15 @@ const XLSX = require('xlsx');
 const { body, validationResult, query } = require('express-validator');
 const Lead = require('../models/Lead');
 const { auth, checkModulePermission, requireSuperadmin, allowLeadCreateForPortal } = require('../middleware/auth');
-// Puppeteer may capture env vars (like `PUPPETEER_CACHE_DIR`) at module load time.
-// We therefore load it lazily inside the PDF route after normalizing cache dir.
-let puppeteer;
-const juice = require('juice');
 const fs = require('fs');
 const path = require('path');
 const { buildTourSummaryHtml } = require('../lib/tourSummaryHtml');
 const { buildTourSummaryPdf } = require('../lib/tourSummaryPdf');
-const { buildTourQuotationDocxHtml } = require('../lib/tourQuotationDocxHtml');
 const { buildTourQuotationDocx } = require('../lib/tourQuotationDocx');
-const { renderPdfFromHtml } = require('../lib/chromePdf');
+const {
+  generateAndSaveLeadPdf,
+  renderQuotationPdfPreview
+} = require('../lib/leadPdfService');
 
 const router = express.Router();
 
@@ -169,6 +167,58 @@ function getLeadFilter(req) {
   }
   return filter;
 }
+
+function assertLeadAccess(req, lead) {
+  const assignedId = lead.assigned_to
+    ? (lead.assigned_to._id ? lead.assigned_to._id.toString() : lead.assigned_to.toString())
+    : null;
+  if (req.user.role === 'staff' && assignedId !== req.user.id) {
+    const err = new Error('Access denied');
+    err.status = 403;
+    throw err;
+  }
+}
+
+/** Persist PDF metadata without re-validating the full lead (select() omits required fields). */
+async function saveLeadPdfMeta(leadId, pdfMeta) {
+  await Lead.findByIdAndUpdate(leadId, { $set: { generatedPdf: pdfMeta } });
+}
+
+const LEAD_PDF_SELECT = [
+  'leadId',
+  'name',
+  'packageName',
+  'destination',
+  'destinations',
+  'travel_date',
+  'tourStartDate',
+  'tourEndDate',
+  'assigned_to',
+  'total_amount',
+  'packageCostPerPerson',
+  'paxCount',
+  'paxType',
+  'paxBreakup',
+  'vehicleType',
+  'hotelCategory',
+  'mealPlan',
+  'tourNights',
+  'tourDays',
+  'pickupPoint',
+  'dropPoint',
+  'accommodation',
+  'flights',
+  'itinerary',
+  'tripImages',
+  'inclusions',
+  'exclusions',
+  'payment_policy',
+  'cancellation_policy',
+  'termsAndConditions',
+  'memorableTrip',
+  'generatedPdf',
+  'createdAt'
+].join(' ');
 
 router.get('/', auth, checkModulePermission(), [
   query('page').optional().isInt({ min: 1 }),
@@ -728,174 +778,120 @@ router.get('/:id/tour-summary-word', auth, checkModulePermission(), async (req, 
   }
 });
 
-/** POST /leads/convert-to-pdf — generate PDF from server-side HTML (fast, no network needed) */
+/** POST /leads/convert-to-pdf — stream PDF from preview/quotation data (Puppeteer + embedded base64 images) */
 router.post('/convert-to-pdf', auth, async (req, res) => {
   try {
     const { leadId, data, fileName } = req.body;
     if (!leadId) return res.status(400).json({ message: 'Lead ID is required' });
 
-    logLine(`PDF Generation Started for lead: ${leadId}`);
-
-    // Build HTML server-side from the data the frontend already sent
-    const { buildTourQuotationHtml } = require('../lib/tourQuotationHtml');
+    logLine(`convert-to-pdf started for lead: ${leadId}`);
     const frontendBaseUrl = resolveFrontendBaseUrl(req);
     const apiBaseUrl = resolveApiBaseUrl(req);
-    const html = buildTourQuotationHtml(data || {}, { frontendBaseUrl, apiBaseUrl });
 
-    logLine('Rendering PDF via headless Chrome...');
-    const { pdfBuffer, chromePath } = renderPdfFromHtml({ html, windowSize: '794,1123', timeoutMs: 30000 });
-    logLine(`PDF generated, size: ${pdfBuffer.length} bytes (chrome=${chromePath})`);
-
-    res.set({
-      "Content-Type": "application/pdf",
-      "Content-Length": pdfBuffer.length,
-      "Content-Disposition": `attachment; filename="${fileName || 'tour-quotation'}.pdf"`
+    const pdfBuffer = await renderQuotationPdfPreview(data || {}, {
+      frontendBaseUrl,
+      apiBaseUrl
     });
+    logLine(`convert-to-pdf buffer size: ${pdfBuffer.length} bytes`);
 
+    const safeName = String(fileName || 'tour-quotation').replace(/[/\\?%*:|"<>]/g, '-');
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Length': pdfBuffer.length,
+      'Content-Disposition': `attachment; filename="${safeName}.pdf"`
+    });
     res.end(pdfBuffer);
-    logLine('PDF successfully sent.');
+    logLine('convert-to-pdf sent successfully');
   } catch (error) {
-    console.error('PDF External Error:', error);
-    logLine(`OUTER ERROR: ${error.message}`);
-    res.status(500).json({ 
-      message: 'Failed to generate PDF', 
+    logLine(`convert-to-pdf failed: ${error.message}\n${error.stack || ''}`);
+    res.status(500).json({
+      message: error.message || 'Failed to generate PDF',
       error: error.message
     });
   }
 });
 
-router.post('/:id/duplicate', auth, checkModulePermission(), async (req, res) => {
+/** POST /leads/:id/generate-pdf — build HTML from DB, render with Puppeteer, save under uploads/ */
+router.post('/:id/generate-pdf', auth, checkModulePermission(), async (req, res) => {
   try {
-    const sourceLead = await Lead.findById(req.params.id).lean();
-    if (!sourceLead) return res.status(404).json({ message: 'Lead not found' });
-
-    const assignedId = sourceLead.assigned_to ? sourceLead.assigned_to.toString() : null;
-    if (req.user.role === 'staff' && assignedId !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    const {
-      _id,
-      leadId,
-      createdAt,
-      updatedAt,
-      __v,
-      ...duplicateData
-    } = sourceLead;
-
-    const duplicatedLead = new Lead({
-      ...duplicateData,
-      name: sourceLead.name ? `(Copy) ${sourceLead.name}` : '(Copy)',
-      assigned_to: sourceLead.assigned_to || undefined
-    });
-
-    await duplicatedLead.save();
-
-    const lead = await Lead.findById(duplicatedLead._id)
-      .populate('assigned_to', 'firstName lastName email')
-      .lean();
-
-    res.status(201).json({ lead });
-  } catch (err) {
-    res.status(500).json({ message: err.message || 'Server error' });
-  }
-});
-
-router.get('/:id', auth, checkModulePermission(), async (req, res) => {
-  try {
-    const lead = await Lead.findById(req.params.id).populate('assigned_to', 'firstName lastName email').lean();
+    const lead = await Lead.findById(req.params.id).select(LEAD_PDF_SELECT);
     if (!lead) return res.status(404).json({ message: 'Lead not found' });
-    const assignedId = lead.assigned_to && (lead.assigned_to._id ? lead.assigned_to._id.toString() : lead.assigned_to.toString());
-    if (req.user.role === 'staff' && assignedId !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-    res.json({ lead });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+    assertLeadAccess(req, lead);
 
-/** GET /leads/:id/tour-summary-pdf — stream PDF of tour summary for the lead */
-router.get('/:id/tour-summary-pdf', auth, checkModulePermission(), async (req, res) => {
-  try {
-    const lead = await Lead.findById(req.params.id)
-      .select([
-        'leadId', 'assigned_to', 'total_amount', 'packageCostPerPerson',
-        'paxCount', 'paxType', 'paxBreakup', 'vehicleType', 'hotelCategory',
-        'mealPlan', 'tourNights', 'tourDays', 'tourStartDate', 'tourEndDate',
-        'travel_date', 'pickupPoint', 'dropPoint', 'destinations', 'destination',
-        'accommodation', 'vehicles', 'flights', 'itinerary', 'inclusions',
-        'exclusions', 'payment_policy', 'cancellation_policy',
-        'termsAndConditions', 'memorableTrip', 'tripImages', 'heroImageUrls'
-      ].join(' '))
-      .populate('assigned_to', 'firstName lastName email')
-      .lean();
-    if (!lead) return res.status(404).json({ message: 'Lead not found' });
-    const assignedId = lead.assigned_to && lead.assigned_to._id
-      ? lead.assigned_to._id.toString()
-      : lead.assigned_to ? lead.assigned_to.toString() : null;
-    if (req.user.role === 'staff' && assignedId !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
     const frontendBaseUrl = resolveFrontendBaseUrl(req);
     const apiBaseUrl = resolveApiBaseUrl(req);
-    logLine(`Streaming Summary PDF for lead: ${lead._id} (frontend=${frontendBaseUrl}, api=${apiBaseUrl})`);
-    await buildTourSummaryPdf(lead, res, { frontendBaseUrl, apiBaseUrl });
+    logLine(`generate-pdf: lead=${lead._id}`);
+
+    const { pdfMeta } = await generateAndSaveLeadPdf(lead, {
+      data: req.body?.data,
+      fileName: req.body?.fileName,
+      frontendBaseUrl,
+      apiBaseUrl
+    });
+
+    await saveLeadPdfMeta(lead._id, pdfMeta);
+
+    res.json({ message: 'PDF generated', pdf: pdfMeta });
   } catch (err) {
-    logLine(`Tour Summary PDF Error: ${err.message}\nStack: ${err.stack}`);
-    res.status(500).json({ message: 'Failed to generate summary PDF', error: err.message });
+    const status = err.status || 500;
+    logLine(`generate-pdf failed: ${err.message}\n${err.stack || ''}`);
+    res.status(status).json({
+      message: err.message || 'Failed to generate PDF',
+      error: err.message
+    });
   }
 });
 
-/** GET /leads/:id/tour-summary-word — download Word-compatible tour summary for the lead */
-router.get('/:id/tour-summary-word', auth, checkModulePermission(), async (req, res) => {
+async function handleDownloadPdf(req, res) {
+  const lead = await Lead.findById(req.params.id).select(LEAD_PDF_SELECT);
+  if (!lead) return res.status(404).json({ message: 'Lead not found' });
+  assertLeadAccess(req, lead);
+
+  const frontendBaseUrl = resolveFrontendBaseUrl(req);
+  const apiBaseUrl = resolveApiBaseUrl(req);
+  logLine(`download-pdf (regenerate): lead=${lead._id}`);
+
+  const { pdfMeta, fullPath } = await generateAndSaveLeadPdf(lead, {
+    data: req.body?.data,
+    fileName: req.body?.fileName || req.query?.fileName,
+    frontendBaseUrl,
+    apiBaseUrl
+  });
+
+  await saveLeadPdfMeta(lead._id, pdfMeta);
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${pdfMeta.fileName}"`);
+  res.setHeader('Content-Length', fs.statSync(fullPath).size);
+  fs.createReadStream(fullPath).pipe(res);
+  logLine(`download-pdf streamed: ${pdfMeta.relativePath}`);
+}
+
+/** GET /leads/:id/download-pdf — regenerate from DB, then stream (call POST generate-pdf first when using preview data) */
+router.get('/:id/download-pdf', auth, checkModulePermission(), async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id)
-      .select([
-        'leadId', 'assigned_to', 'destination', 'travel_date', 'total_amount',
-        'packageCostPerPerson', 'paxCount', 'paxType', 'paxBreakup',
-        'vehicleType', 'hotelCategory', 'mealPlan', 'tourNights', 'tourDays',
-        'tourStartDate', 'tourEndDate', 'pickupPoint', 'dropPoint',
-        'destinations', 'accommodation', 'vehicles', 'flights', 'itinerary',
-        'tripImages', 'inclusions', 'exclusions', 'payment_policy',
-        'cancellation_policy', 'termsAndConditions', 'memorableTrip'
-      ].join(' '))
-      .populate('assigned_to', 'firstName lastName email')
-      .lean();
-    if (!lead) return res.status(404).json({ message: 'Lead not found' });
-    const assignedId = lead.assigned_to && lead.assigned_to._id
-      ? lead.assigned_to._id.toString()
-      : lead.assigned_to ? lead.assigned_to.toString() : null;
-    if (req.user.role === 'staff' && assignedId !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    const leadId2 = lead.leadId || lead._id?.toString() || 'lead';
-    const frontendBaseUrl = resolveFrontendBaseUrl(req);
-    const apiBaseUrl = resolveApiBaseUrl(req);
-    let html = buildTourSummaryHtml(lead, { frontendBaseUrl, apiBaseUrl });
-    
-    html = html.replace(/<head\b[^>]*>([\s\S]*?)<\/head>/gi, "")
-               .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, "")
-               .replace(/<!DOCTYPE html>/gi, "")
-               .replace(/<\/?html\b[^>]*>/gi, "")
-               .replace(/<\/?body\b[^>]*>/gi, "");
-    
-    const HTMLToDOCX = require('html-to-docx');
-    const docxBuffer = await HTMLToDOCX(html, null, {
-      table: { row: { cantSplit: true } },
-      footer: true,
-      pageNumber: true,
-    });
-
-    logLine(`Streaming Summary Word for lead: ${lead._id}`);
-    res.setHeader('Content-Disposition', `attachment; filename="tour-summary-${leadId2}.docx"`);
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-    res.send(docxBuffer);
-    logLine('Summary Word file sent successfully');
+    await handleDownloadPdf(req, res);
   } catch (err) {
-    logLine(`Tour Summary Word Error: ${err.message}\nStack: ${err.stack}`);
-    res.status(500).json({ message: 'Failed to generate Word summary', error: err.message });
+    const status = err.status || 500;
+    logLine(`download-pdf failed: ${err.message}\n${err.stack || ''}`);
+    res.status(status).json({
+      message: err.message || 'Failed to download PDF',
+      error: err.message
+    });
+  }
+});
+
+/** POST /leads/:id/download-pdf — regenerate with optional preview payload, then stream */
+router.post('/:id/download-pdf', auth, checkModulePermission(), async (req, res) => {
+  try {
+    await handleDownloadPdf(req, res);
+  } catch (err) {
+    const status = err.status || 500;
+    logLine(`download-pdf failed: ${err.message}\n${err.stack || ''}`);
+    res.status(status).json({
+      message: err.message || 'Failed to download PDF',
+      error: err.message
+    });
   }
 });
 

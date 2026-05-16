@@ -1,4 +1,8 @@
 .env
 uploads
 .cache/puppeteer/
+uploads/leads/
+pdf-debug.log
 node_modules/
+test-output-verify.pdf
+pdf-debug.log
